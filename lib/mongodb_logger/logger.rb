@@ -21,19 +21,18 @@ module MongodbLogger
       ["moped", Adapers::Moped]
     ]
 
-    attr_reader   :db_configuration, :mongo_adapter
-    attr_accessor :excluded_from_log
+    attr_reader   :db_configuration, :mongo_adapter, :app_root, :app_env
+    attr_writer   :excluded_from_log
 
     def initialize(path = nil, level = DEBUG)
       set_root_and_env
-
       begin
-        path ||= File.join(@app_root, "log/#{@app_env}.log")
+        path ||= File.join(app_root, "log/#{app_env}.log")
         @level = level
         internal_initialize
       rescue => e
         # should use a config block for this
-        Rails.env.production? ? (raise e) : (puts "MongodbLogger WARNING: Using Rails Logger due to exception: #{e.message}")
+        "production" == app_env ? (raise e) : (puts "MongodbLogger WARNING: Using Rails Logger due to exception: #{e.message}")
       ensure
         if disable_file_logging?
           @log            = ::Logger.new(STDOUT)
@@ -57,10 +56,7 @@ module MongodbLogger
     def add(severity, message = nil, progname = nil, &block)
       $stdout.puts(message) if ENV['HEROKU_RACK'] # log in stdout on Heroku
       if @level && @level <= severity && (message.present? || progname.present?) && @mongo_record.present?
-        # do not modify the original message used by the buffered logger
-        msg = (message ? message : progname)
-        msg = logging_colorized? ? msg.to_s.gsub(/(\e(\[([\d;]*[mz]?))?)?/, '').strip : msg
-        @mongo_record[:messages][LOG_LEVEL_SYM[severity]] << msg
+        add_log_message(severity, message, progname)
       end
       # may modify the original message
       disable_file_logging? ? message : (@level ? super : message)
@@ -75,9 +71,7 @@ module MongodbLogger
 
       runtime = Benchmark.measure{ yield }.real if block_given?
     rescue Exception => e
-      add(3, "#{e.message}\n#{e.backtrace.join("\n")}")
-      # log exceptions
-      @mongo_record[:is_exception] = true
+      log_raised_error(e)
       # Reraise the exception for anyone else who cares
       raise e
     ensure
@@ -85,19 +79,11 @@ module MongodbLogger
       @mongo_record[:runtime] = ((runtime ||= 0) * 1000).ceil
       # error callback
       Base.on_log_exception(@mongo_record) if @mongo_record[:is_exception]
-      begin
-        @insert_block.call
-      rescue
-        begin
-          # try to nice serialize record
-          record_serializer @mongo_record, true
-          @insert_block.call
-        rescue
-          # do extra work to inspect (and flatten)
-          record_serializer @mongo_record, false
-          @insert_block.call rescue nil
-        end
-      end
+      ensure_write_to_mongodb
+    end
+
+    def excluded_from_log
+      @excluded_from_log ||= nil
     end
 
     private
@@ -113,13 +99,12 @@ module MongodbLogger
     end
 
     def configure
-      default_capsize = DEFAULT_COLLECTION_SIZE
       @db_configuration = {
         host: 'localhost',
         port: 27017,
-        capsize: default_capsize,
+        capsize: DEFAULT_COLLECTION_SIZE,
         ssl: false}.merge(resolve_config).with_indifferent_access
-      @db_configuration[:collection] ||= "#{@app_env}_log"
+      @db_configuration[:collection] ||= "#{app_env}_log"
       @db_configuration[:application_name] ||= resolve_application_name
       @db_configuration[:write_options] ||= { w: 0, wtimeout: 200 }
 
@@ -129,20 +114,56 @@ module MongodbLogger
     end
 
     def resolve_application_name
-      Rails.application.class.to_s.split("::").first if defined?(Rails)
+      if defined?(Rails)
+        Rails.application.class.to_s.split("::").first
+      else
+        "RackApp"
+      end
+    end
+
+    def add_log_message(severity, message, progname)
+      # do not modify the original message used by the buffered logger
+      msg = (message ? message : progname)
+      msg = logging_colorized? ? msg.to_s.gsub(/(\e(\[([\d;]*[mz]?))?)?/, '').strip : msg
+      @mongo_record[:messages][LOG_LEVEL_SYM[severity]] << msg
+    end
+
+    def log_raised_error(e)
+      add(3, "#{e.message}\n#{e.backtrace.join("\n")}")
+      # log exceptions
+      @mongo_record[:is_exception] = true
+    end
+
+    def ensure_write_to_mongodb
+      @insert_block.call
+    rescue
+      begin
+        # try to nice serialize record
+        record_serializer @mongo_record, true
+        @insert_block.call
+      rescue
+        # do extra work to inspect (and flatten)
+        record_serializer @mongo_record, false
+        @insert_block.call rescue nil
+      end
     end
 
     def resolve_config
       config = {}
       CONFIGURATION_FILES.each do |filename|
-        config_file = File.join(@app_root, 'config', filename)
-        if File.file? config_file
-          config = YAML.load(ERB.new(File.new(config_file).read).result)[@app_env]
-          config = config['mongodb_logger'] if config && config.has_key?('mongodb_logger')
-          break unless config.blank?
-        end
+        config = read_config_from_file(File.join(app_root, 'config', filename))
+        break unless config.blank?
       end
       config
+    end
+
+    def read_config_from_file(config_file)
+      if File.file? config_file
+        config = YAML.load(ERB.new(File.new(config_file).read).result)[app_env]
+        config = config['mongodb_logger'] if config && config.has_key?('mongodb_logger')
+        return config unless config.blank?
+      end
+      return nil
     end
 
     def find_adapter
@@ -172,7 +193,7 @@ module MongodbLogger
     end
 
     def insert_log_record(write_options)
-      return if (excluded_from_log || {}).any? { |k, v| v.include?(@mongo_record[k]) }
+      return if excluded_from_log && excluded_from_log.any? { |k, v| v.include?(@mongo_record[k]) }
       @mongo_adapter.insert_log_record(@mongo_record, write_options: write_options)
     end
 
@@ -214,11 +235,11 @@ module MongodbLogger
 
     def set_root_and_env
       if defined? Rails
-        @app_root = Rails.root.to_s
-        @app_env  = Rails.env.to_s
+        @app_root, @app_env = Rails.root.to_s, Rails.env.to_s
       elsif defined? RACK_ROOT
-        @app_root = RACK_ROOT
-        @app_env  = ENV['RACK_ENV'] || 'production'
+        @app_root, @app_env = RACK_ROOT, (ENV['RACK_ENV'] || 'production')
+      else
+        @app_root, @app_env = File.dirname(__FILE__), 'production'
       end
     end
 
