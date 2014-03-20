@@ -82,6 +82,15 @@ root.MongodbLoggerMain =
           MongodbLoggerMain.moveByLogs('end')
         when 40 # down
           MongodbLoggerMain.moveByLogs('down')
+    # extra log data
+    $(document).on 'click', 'a#extra_log_data_link', (e) =>
+      e.preventDefault()
+      $("a#extra_log_data_link").hide()
+      $('#extra_log_data').show()
+      $('html, body').animate({
+        scrollTop: $("#extra_log_data").offset().top
+      }, 300);
+
     # init pjax
     @initPjax()
     @initOnPages()

@@ -2,6 +2,7 @@
 
 <div class="unit-right">
   <div class="pam">
+    <a href="#" id="extra_log_data_link" class="button small grey">JSON</a>
     <a href="<%=h url_path("overview") %>" data-pjax='true' class="button small grey">Back</a>
   </div> <!-- pam -->
 </div> <!-- unit-right -->
@@ -112,4 +113,13 @@
       </div> <!-- unit -->
     </li>
   <% end %>
+
+  <li id="extra_log_data" class="outer pvs phm ui-helper-hidden">
+    <div class="unit size1of5">
+      <span class="pale">Raw JSON:</span>
+    </div> <!-- unit -->
+    <div class="unit size4of5">
+      <pre><code><%= JSON.pretty_generate(@log.as_json) %></code></pre>
+    </div> <!-- unit -->
+  </li>
 </ul>
